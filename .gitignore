@@ -152,3 +152,4 @@ LICENSE
 pyproject.toml
 
 pip_token
+build
