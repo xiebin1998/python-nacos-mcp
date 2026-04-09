@@ -1,0 +1,278 @@
+import asyncio
+import json
+import logging
+from contextlib import AbstractAsyncContextManager
+from typing import Literal, Callable, Any
+from importlib import metadata
+
+import jsonref
+from mcp import types, Tool
+from mcp.server import Server
+from mcp.server.lowlevel.server import LifespanResultT, RequestT
+from mcp.server.lowlevel.server import lifespan
+from nacos_mcp_wrapper.server.nacos_server import NacosServer
+
+from v2.nacos import RegisterInstanceParam, \
+    ClientConfigBuilder, NacosException, NacosNamingService, GRPCConfig
+from v2.nacos.ai.model.ai_param import GetMcpServerParam, \
+    RegisterMcpServerEndpointParam, ReleaseMcpServerParam, \
+    SubscribeMcpServerParam
+from v2.nacos.ai.model.mcp.mcp import McpToolMeta, McpServerDetailInfo, McpTool, \
+    McpServiceRef, McpToolSpecification, McpServerBasicInfo, \
+    McpServerRemoteServiceConfig, McpEndpointSpec
+from v2.nacos.ai.model.mcp.registry import ServerVersionDetail
+from v2.nacos.ai.nacos_ai_service import NacosAIService
+
+from nacos_mcp_wrapper.server.nacos_settings import NacosSettings
+from nacos_mcp_wrapper.server.utils import get_first_non_loopback_ip, \
+    jsonref_default, compare, pkg_version
+
+logger = logging.getLogger(__name__)
+
+TRANSPORT_MAP = {
+    "stdio": "stdio",
+    "sse": "mcp-sse",
+    "streamable-http": "mcp-streamable",
+}
+
+
+class PhnixNacosServer(NacosServer):
+    def __init__(
+            self,
+            name: str,
+            nacos_settings: NacosSettings | None = None,
+            version: str | None = None,
+            instructions: str | None = None,
+            website_url: str | None = None,
+            icons: list[types.Icon] | None = None,
+            lifespan: Callable[
+                [Server[LifespanResultT, RequestT]],
+                AbstractAsyncContextManager[LifespanResultT],
+            ] = lifespan,
+    ):
+        if version is None:
+            version = pkg_version("mcp")
+        super().__init__(name=name,
+                         version=version,
+                         instructions=instructions,
+                         website_url=website_url,
+                         icons=icons,
+                         lifespan=lifespan)
+
+        if nacos_settings == None:
+            nacos_settings = NacosSettings()
+        if nacos_settings.NAMESPACE == "":
+            nacos_settings.NAMESPACE = "public"
+
+        self._nacos_settings = nacos_settings
+        if self._nacos_settings.SERVICE_IP is None:
+            self._nacos_settings.SERVICE_IP = get_first_non_loopback_ip()
+
+        self._type: str | None = None
+        ai_client_config_builder = ClientConfigBuilder()
+        (
+            ai_client_config_builder.server_address(self._nacos_settings.SERVER_ADDR)
+            .namespace_id(self._nacos_settings.NAMESPACE)
+            .access_key(self._nacos_settings.ACCESS_KEY)
+            .secret_key(self._nacos_settings.SECRET_KEY)
+            .username(self._nacos_settings.USERNAME)
+            .password(self._nacos_settings.PASSWORD)
+            .app_conn_labels(self._nacos_settings.APP_CONN_LABELS)
+            .grpc_config(GRPCConfig(grpc_timeout=60000))
+        )
+
+        if self._nacos_settings.CREDENTIAL_PROVIDER is not None:
+            ai_client_config_builder.credentials_provider(
+                self._nacos_settings.CREDENTIAL_PROVIDER)
+
+        self._ai_client_config = ai_client_config_builder.build()
+
+        self._nacos_ai_service: NacosAIService | None = None
+
+        self._nacos_naming_service: NacosNamingService | None = None
+
+        self._tmp_tools: dict[str, Tool] = {}
+        self._tools_meta: dict[str, McpToolMeta] = {}
+        self._tmp_tools_list_handler = None
+
+    async def get_mcp_server(self, param: GetMcpServerParam):
+        try:
+            # 每次查询需要重新创建NacosAIService
+            if self._nacos_ai_service is not None:
+                await self._nacos_ai_service.shutdown()
+            self._nacos_ai_service = await NacosAIService.create_ai_service(
+                self._ai_client_config
+            )
+            return await self._nacos_ai_service.get_mcp_server(param)
+        except NacosException as e:
+            logger.info(f"未查询到MCP服务,{param.mcp_name},version:{param.version},ERROR:{e.message}")
+
+    async def release_mcp_server(self, param: ReleaseMcpServerParam):
+        # 重新创建NacosAIService
+        if self._nacos_ai_service is not None:
+            await self._nacos_ai_service.shutdown()
+        self._nacos_ai_service = await NacosAIService.create_ai_service(
+            self._ai_client_config
+        )
+        return await self._nacos_ai_service.release_mcp_server(param)
+
+    async def register_to_nacos(self,
+                                transport: Literal["stdio", "sse", "streamable-http"] = "stdio",
+                                port: int = 8000,
+                                path: str = "/sse"):
+        try:
+            self._type = TRANSPORT_MAP.get(transport, None)
+            # self._nacos_ai_service = await NacosAIService.create_ai_service(
+            #     self._ai_client_config
+            # )
+            self._nacos_naming_service = await NacosNamingService.create_naming_service(
+                self._ai_client_config
+            )
+
+            # 查询指定版本的MCP服务是否存在
+            server_detail_info = await self.get_mcp_server(
+                GetMcpServerParam(
+                    mcp_name=self.name,
+                    version=self.version
+                ))
+            if server_detail_info is None:
+                # 查询最新版本是否存在
+                server_detail_info = await self.get_mcp_server(
+                    GetMcpServerParam(
+                        mcp_name=self.name,
+                        version=None
+                    ))
+
+            if types.ListToolsRequest in self.request_handlers:
+                await self.init_tools_tmp()
+                self.list_tools()(self._list_tmp_tools)
+
+            # 查询到了MCP服务
+            if server_detail_info is not None:
+                # 判断MCP服务的版本是否一致
+                # if server_detail_info.version != self.version:
+
+                is_compatible, error_msg = self.check_compatible(
+                    server_detail_info)
+                if is_compatible:
+                    # logger.error(
+                    #     f"mcp server info is not compatible,{self.name},version:{self.version},reason:{error_msg}")
+                    # raise NacosException(
+                    #     f"mcp server info is not compatible,{self.name},version:{self.version},reason:{error_msg}"
+                    # )
+                    if types.ListToolsRequest in self.request_handlers:
+                        self.update_tools(server_detail_info)
+                    if self._nacos_settings.SERVICE_REGISTER and (
+                            self._type == "mcp-sse"
+                            or self._type == "mcp-streamable"):
+                        version = metadata.version('nacos-mcp-wrapper-python')
+                        service_meta_data = {
+                            "source": f"nacos-mcp-wrapper-python-{version}",
+                            **self._nacos_settings.SERVICE_META_DATA}
+                        await self._nacos_naming_service.register_instance(
+                            request=RegisterInstanceParam(
+                                group_name=server_detail_info.remoteServerConfig.serviceRef.groupName,
+                                service_name=server_detail_info.remoteServerConfig.serviceRef.serviceName,
+                                ip=self._nacos_settings.SERVICE_IP,
+                                port=self._nacos_settings.SERVICE_PORT if self._nacos_settings.SERVICE_PORT else port,
+                                ephemeral=self._nacos_settings.SERVICE_EPHEMERAL,
+                                metadata=service_meta_data
+                            )
+                        )
+                    await self.subscribe()
+                    logger.info(
+                        f"Register to nacos success,{self.name},version:{self.version}")
+                    return
+
+            mcp_tool_specification = None
+            if types.ListToolsRequest in self.request_handlers:
+                tool_spec = [
+                    McpTool(
+                        name=tool.name,
+                        description=tool.description,
+                        inputSchema=tool.inputSchema,
+                    )
+                    for tool in list(self._tmp_tools.values())
+                ]
+                mcp_tool_specification = McpToolSpecification(
+                    tools=tool_spec
+                )
+
+            server_version_detail = ServerVersionDetail()
+            server_version_detail.version = self.version
+            server_version_detail.is_latest = True
+            server_basic_info = McpServerBasicInfo()
+            server_basic_info.name = self.name
+            server_basic_info.version = self.version
+            server_basic_info.versionDetail = server_version_detail
+            server_basic_info.description = self.instructions or self.name
+
+            endpoint_spec = McpEndpointSpec()
+            if self._type == "stdio":
+                server_basic_info.protocol = self._type
+                server_basic_info.frontProtocol = self._type
+            else:
+                endpoint_spec.type = "REF"
+                data = {
+                    "serviceName": self.get_register_service_name(),
+                    "groupName": "DEFAULT_GROUP" if self._nacos_settings.SERVICE_GROUP is None else self._nacos_settings.SERVICE_GROUP,
+                    "namespaceId": self._nacos_settings.NAMESPACE,
+                }
+                endpoint_spec.data = data
+
+                remote_server_config_info = McpServerRemoteServiceConfig()
+                remote_server_config_info.exportPath = path
+                server_basic_info.remoteServerConfig = remote_server_config_info
+                server_basic_info.protocol = self._type
+                server_basic_info.frontProtocol = self._type
+
+            _server = await self.get_mcp_server(
+                GetMcpServerParam(
+                    mcp_name=self.name,
+                    version=self.version
+                ))
+            try:
+                if _server is None:
+                    # 重新创建NacosAIService
+                    await self.release_mcp_server(
+                        ReleaseMcpServerParam(
+                            server_spec=server_basic_info,
+                            tool_spec=mcp_tool_specification,
+                            mcp_endpoint_spec=endpoint_spec
+                        ))
+                else:
+                    _is_compatible, error_msg = self.check_compatible(
+                        _server)
+                    if not _is_compatible:
+                        logger.error(
+                            f"mcp server info is not compatible,{self.name},version:{self.version},reason:{error_msg}")
+                        raise NacosException(
+                            f"mcp server info is not compatible,{self.name},version:{self.version},reason:{error_msg}"
+                        )
+            except Exception as e:
+                logger.error(
+                    f"Release mcp server {self.name} to Nacos Failed,try to update it")
+                raise RuntimeError(
+                    f"Release mcp server {self.name} to Nacos Failed")
+            if self._nacos_settings.SERVICE_REGISTER and (
+                    self._type == "mcp-sse"
+                    or self._type == "mcp-streamable"):
+                version = metadata.version('nacos-mcp-wrapper-python')
+                service_meta_data = {
+                    "source": f"nacos-mcp-wrapper-python-{version}",
+                    **self._nacos_settings.SERVICE_META_DATA}
+                await self._nacos_naming_service.register_instance(
+                    request=RegisterInstanceParam(
+                        group_name="DEFAULT_GROUP" if self._nacos_settings.SERVICE_GROUP is None else self._nacos_settings.SERVICE_GROUP,
+                        service_name=self.get_register_service_name(),
+                        ip=self._nacos_settings.SERVICE_IP,
+                        port=self._nacos_settings.SERVICE_PORT if self._nacos_settings.SERVICE_PORT else port,
+                        ephemeral=self._nacos_settings.SERVICE_EPHEMERAL,
+                        metadata=service_meta_data
+                    )
+                )
+            await self.subscribe()
+            logger.info(
+                f"Register to nacos success,{self.name},version:{self.version}")
+        except Exception as e:
+            logger.error(f"Failed to register MCP server to Nacos: {e}")
