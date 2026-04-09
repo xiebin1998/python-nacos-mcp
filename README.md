@@ -22,6 +22,9 @@ pip install phnix-nacos-mcp
 ```python
 from phnix_nacos_mcp import PhnixNacosMCP
 from nacos_mcp_wrapper.server.nacos_settings import NacosSettings
+from typing import Annotated, Any
+from pydantic import Field
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 
 # 配置 Nacos 设置
 nacos_settings = NacosSettings(
@@ -39,11 +42,34 @@ mcp = PhnixNacosMCP(
     instructions="这是一个示例 MCP 服务器"
 )
 
+
 # 添加工具
-@mcp.tool()
-def my_tool(param: str) -> str:
-    """示例工具"""
-    return f"处理结果: {param}"
+@mcp.tool(description="计算两个整数相加的结果")
+def add(
+        a: Annotated[int, Field(description="被加数")],
+        b: Annotated[int, Field(description="加数")]
+) -> int:
+    return a + b
+
+
+# ====================== 工具入参出参（必须继承 ArgModelBase）======================
+class MyToolInput(ArgModelBase):
+    a: int = Field(description="第一个数字")
+    b: int = Field(description="第二个数字")
+
+
+class MyToolOutput(ArgModelBase):
+    sum: int = Field(description="两个数字的和")
+    product: int = Field(description="两个数字的积")
+
+
+@mcp.tool(description="输入两个数字，返回和与积")
+def calculate(input: MyToolInput) -> MyToolOutput:
+    return MyToolOutput(
+        sum=input.a + input.b,
+        product=input.a * input.b
+    )
+
 
 # 运行服务器
 if __name__ == "__main__":
@@ -97,20 +123,20 @@ asyncio.run(mcp.run_streamable_http_async())
 
 ### NacosSettings 配置项
 
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| SERVER_ADDR | Nacos 服务器地址 | localhost:8848 |
-| NAMESPACE | 命名空间 | public |
-| USERNAME | 用户名 | - |
-| PASSWORD | 密码 | - |
-| ACCESS_KEY | 访问密钥 | - |
-| SECRET_KEY | 密钥 | - |
-| SERVICE_IP | 服务 IP | 自动获取 |
-| SERVICE_PORT | 服务端口 | 8000 |
-| SERVICE_GROUP | 服务分组 | DEFAULT_GROUP |
-| SERVICE_EPHEMERAL | 是否临时实例 | True |
-| SERVICE_REGISTER | 是否注册服务 | True |
-| SERVICE_META_DATA | 服务元数据 | {} |
+| 配置项               | 说明          | 默认值            |
+|-------------------|-------------|----------------|
+| SERVER_ADDR       | Nacos 服务器地址 | localhost:8848 |
+| NAMESPACE         | 命名空间        | public         |
+| USERNAME          | 用户名         | -              |
+| PASSWORD          | 密码          | -              |
+| ACCESS_KEY        | 访问密钥        | -              |
+| SECRET_KEY        | 密钥          | -              |
+| SERVICE_IP        | 服务 IP       | 自动获取           |
+| SERVICE_PORT      | 服务端口        | 8000           |
+| SERVICE_GROUP     | 服务分组        | DEFAULT_GROUP  |
+| SERVICE_EPHEMERAL | 是否临时实例      | True           |
+| SERVICE_REGISTER  | 是否注册服务      | True           |
+| SERVICE_META_DATA | 服务元数据       | {}             |
 
 ## 依赖项
 
@@ -118,33 +144,6 @@ asyncio.run(mcp.run_streamable_http_async())
 - mcp >= 1.0.0
 - nacos-mcp-wrapper-python >= 0.1.0
 - jsonref >= 1.0.0
-
-## 开发
-
-### 安装开发依赖
-
-```bash
-pip install -e ".[dev]"
-```
-
-### 运行测试
-
-```bash
-pytest
-```
-
-### 代码格式化
-
-```bash
-black src/
-isort src/
-```
-
-### 类型检查
-
-```bash
-mypy src/
-```
 
 ## 许可证
 
