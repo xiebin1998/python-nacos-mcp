@@ -1,9 +1,10 @@
+import json
 import os
-from typing import Annotated, Any
+from typing import Annotated
 from mcp.server.auth.provider import TokenVerifier, AccessToken
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp.tools import Tool
-from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata, ArgModelBase
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase, FuncMetadata
 from nacos_mcp_wrapper.server.nacos_settings import NacosSettings
 from pydantic import Field, AnyHttpUrl
 
@@ -54,6 +55,7 @@ def calculate(input: MyToolInput) -> MyToolOutput:
 nacos_settings = NacosSettings()
 nacos_settings.SERVER_ADDR = "47.245.135.32:8848"
 nacos_settings.NAMESPACE = "mcp-dev"
+nacos_settings.SERVICE_GROUP="mcp-endpoints"
 nacos_settings.USERNAME = "nacos"
 nacos_settings.PASSWORD = "nacos"
 
@@ -68,7 +70,7 @@ mcp = PhnixNacosMCP(
     name="compute-mcp",
     instructions="计算 MCP 服务",
     nacos_settings=nacos_settings,
-    version="2.0.11",
+    version="1.0.0",
     port=18001,
     auth=auth_settings,
     token_verifier=MyTokenVerifier(),
@@ -78,25 +80,48 @@ mcp = PhnixNacosMCP(
             name="calculate",
             title="数字计算工具",
             description="输入两个数字，返回和与积",
-        )
+        ),
+        # Tool(
+        #     fn=calculate,
+        #     name="calculate",
+        #     title="数字计算工具",
+        #     description="输入两个数字，返回和与积",
+        #     fn_metadata=FuncMetadata(
+        #         arg_model=MyToolInput,
+        #         output_model=MyToolOutput,
+        #         wrap_output=True
+        #     )
+        # )
     ]
 )
 
 
 # ====================== 工具函数 ======================
-@mcp.tool(description="计算两个整数相加的结果")
+# @mcp.tool()
 def add(
-        a: Annotated[int, Field(description="被加数")],
-        b: Annotated[int, Field(description="加数")]
+        a: int,
+        b: int
 ) -> int:
+    """
+    计算两个整数相加的结果
+    :param a: 被加数
+    :param b: 加数
+    :return: 结果
+    """
     return a + b
 
 
-@mcp.tool(description="计算两个整数相减的结果")
+# @mcp.tool()
 def minus(
-        a: Annotated[int, Field(description="被减数")],
-        b: Annotated[int, Field(description="减数")]
+        a: int,
+        b: int
 ) -> int:
+    """
+    计算两个整数相减的结果
+    :param a: 被减数
+    :param b: 减数
+    :return: 结果
+    """
     return a - b
 
 

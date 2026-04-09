@@ -21,11 +21,14 @@ from v2.nacos.ai.model.mcp.mcp import McpToolMeta, McpServerDetailInfo, McpTool,
     McpServiceRef, McpToolSpecification, McpServerBasicInfo, \
     McpServerRemoteServiceConfig, McpEndpointSpec
 from v2.nacos.ai.model.mcp.registry import ServerVersionDetail
-from v2.nacos.ai.nacos_ai_service import NacosAIService
 
 from nacos_mcp_wrapper.server.nacos_settings import NacosSettings
 from nacos_mcp_wrapper.server.utils import get_first_non_loopback_ip, \
     jsonref_default, compare, pkg_version
+
+from phnix_nacos_mcp.model.mcp_param import PhnixMcpTool, PhnixReleaseMcpServerParam, PhnixMcpToolSpecification, \
+    PhnixSubscribeMcpServerParam
+from phnix_nacos_mcp.nacos_ai_service import PhnixNacosAIService
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +90,7 @@ class PhnixNacosServer(NacosServer):
 
         self._ai_client_config = ai_client_config_builder.build()
 
-        self._nacos_ai_service: NacosAIService | None = None
+        self._nacos_ai_service: PhnixNacosAIService | None = None
 
         self._nacos_naming_service: NacosNamingService | None = None
 
@@ -97,24 +100,74 @@ class PhnixNacosServer(NacosServer):
 
     async def get_mcp_server(self, param: GetMcpServerParam):
         try:
-            # 每次查询需要重新创建NacosAIService
+            # 每次查询需要重新创建PhnixNacosAIService
             if self._nacos_ai_service is not None:
                 await self._nacos_ai_service.shutdown()
-            self._nacos_ai_service = await NacosAIService.create_ai_service(
+            self._nacos_ai_service = await PhnixNacosAIService.create_ai_service(
                 self._ai_client_config
             )
             return await self._nacos_ai_service.get_mcp_server(param)
         except NacosException as e:
             logger.info(f"未查询到MCP服务,{param.mcp_name},version:{param.version},ERROR:{e.message}")
 
-    async def release_mcp_server(self, param: ReleaseMcpServerParam):
-        # 重新创建NacosAIService
+    async def release_mcp_server(self, param: PhnixReleaseMcpServerParam):
+        # 重新创建PhnixNacosAIService
         if self._nacos_ai_service is not None:
             await self._nacos_ai_service.shutdown()
-        self._nacos_ai_service = await NacosAIService.create_ai_service(
+        self._nacos_ai_service = await PhnixNacosAIService.create_ai_service(
             self._ai_client_config
         )
         return await self._nacos_ai_service.release_mcp_server(param)
+
+    async def unsubscribe(self, param: SubscribeMcpServerParam):
+        if self._nacos_ai_service is not None:
+            await self._nacos_ai_service.shutdown()
+        self._nacos_ai_service = await PhnixNacosAIService.create_ai_service(
+            self._ai_client_config
+        )
+        async def mcp_listener(mcp_id, namespace_id, mcp_name, mcp_server_detail):
+            logger.info(f"MCP Server 变更: {mcp_name}, 版本: {mcp_server_detail.version}")
+
+        param.subscribe_callback = mcp_listener
+        return await self._nacos_ai_service.unsubscribe_mcp_server(param)
+
+    def update_tools(self, server_detail_info: McpServerDetailInfo):
+
+        def update_args_description(_local_args: dict[str, Any],
+                                    _nacos_args: dict[str, Any]):
+            for key, value in _local_args.items():
+                if key in _nacos_args and "description" in _nacos_args[key]:
+                    _local_args[key]["description"] = _nacos_args[key][
+                        "description"]
+
+        tool_spec = server_detail_info.toolSpec
+        if tool_spec is None:
+            return
+        if tool_spec.toolsMeta is None:
+            self._tools_meta = {}
+        else:
+            self._tools_meta = tool_spec.toolsMeta
+        if tool_spec.tools is None:
+            return
+        for tool in tool_spec.tools:
+            if tool.name in self._tmp_tools:
+                local_tool = self._tmp_tools[tool.name]
+                if tool.description is not None:
+                    local_tool.description = tool.description
+
+                local_args = local_tool.inputSchema["properties"]
+                nacos_args = tool.inputSchema["properties"]
+                update_args_description(local_args, nacos_args)
+                continue
+        pass
+
+    async def subscribe(self):
+        await self._nacos_ai_service.subscribe_mcp_server(
+            PhnixSubscribeMcpServerParam(
+                mcp_name=self.name,
+                version=self.version,
+                subscribe_callback=self._subscribe_call_back
+            ))
 
     async def register_to_nacos(self,
                                 transport: Literal["stdio", "sse", "streamable-http"] = "stdio",
@@ -122,12 +175,14 @@ class PhnixNacosServer(NacosServer):
                                 path: str = "/sse"):
         try:
             self._type = TRANSPORT_MAP.get(transport, None)
-            # self._nacos_ai_service = await NacosAIService.create_ai_service(
+            # self._nacos_ai_service = await PhnixNacosAIService.create_ai_service(
             #     self._ai_client_config
             # )
             self._nacos_naming_service = await NacosNamingService.create_naming_service(
                 self._ai_client_config
             )
+
+
 
             # 查询指定版本的MCP服务是否存在
             server_detail_info = await self.get_mcp_server(
@@ -142,6 +197,8 @@ class PhnixNacosServer(NacosServer):
                         mcp_name=self.name,
                         version=None
                     ))
+            # else:
+            #     version_ = await self.unsubscribe(SubscribeMcpServerParam(mcp_name=self.name, version=self.version))
 
             if types.ListToolsRequest in self.request_handlers:
                 await self.init_tools_tmp()
@@ -160,8 +217,8 @@ class PhnixNacosServer(NacosServer):
                     # raise NacosException(
                     #     f"mcp server info is not compatible,{self.name},version:{self.version},reason:{error_msg}"
                     # )
-                    if types.ListToolsRequest in self.request_handlers:
-                        self.update_tools(server_detail_info)
+                    # if types.ListToolsRequest in self.request_handlers:
+                    #     self.update_tools(server_detail_info)
                     if self._nacos_settings.SERVICE_REGISTER and (
                             self._type == "mcp-sse"
                             or self._type == "mcp-streamable"):
@@ -187,14 +244,15 @@ class PhnixNacosServer(NacosServer):
             mcp_tool_specification = None
             if types.ListToolsRequest in self.request_handlers:
                 tool_spec = [
-                    McpTool(
+                    PhnixMcpTool(
                         name=tool.name,
                         description=tool.description,
                         inputSchema=tool.inputSchema,
+                        outputSchema=tool.outputSchema
                     )
                     for tool in list(self._tmp_tools.values())
                 ]
-                mcp_tool_specification = McpToolSpecification(
+                mcp_tool_specification = PhnixMcpToolSpecification(
                     tools=tool_spec
                 )
 
@@ -233,9 +291,9 @@ class PhnixNacosServer(NacosServer):
                 ))
             try:
                 if _server is None:
-                    # 重新创建NacosAIService
+                    # 重新创建PhnixNacosAIService
                     await self.release_mcp_server(
-                        ReleaseMcpServerParam(
+                        PhnixReleaseMcpServerParam(
                             server_spec=server_basic_info,
                             tool_spec=mcp_tool_specification,
                             mcp_endpoint_spec=endpoint_spec
@@ -276,3 +334,5 @@ class PhnixNacosServer(NacosServer):
                 f"Register to nacos success,{self.name},version:{self.version}")
         except Exception as e:
             logger.error(f"Failed to register MCP server to Nacos: {e}")
+
+
